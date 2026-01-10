@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(python:*)",
+      "Bash(venv/Scripts/python:*)",
+      "Bash(where:*)",
+      "Bash(\"/c/Users/benno/AppData/Local/Programs/Python/Python310/python.exe\" -m venv venv)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/python.exe\" -m pip install --upgrade pip wheel setuptools)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/pip.exe\" install:*)",
+      "Bash(npm install:*)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/pip.exe\" install -r requirements.txt)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/pip.exe\" install fastapi uvicorn[standard] python-multipart websockets pydantic diffusers transformers accelerate safetensors peft datasets wandb huggingface-hub sentencepiece protobuf pyyaml tqdm opencv-python)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/pip.exe\" install xformers bitsandbytes)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/pip.exe\" install --upgrade torchvision torchaudio)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/python.exe\" -c \"import torch; print\\(f''PyTorch: {torch.__version__}''\\); print\\(f''CUDA: {torch.cuda.is_available\\(\\)}''\\); print\\(f''GPU: {torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else \"\"N/A\"\"}''\\)\")",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/pip.exe\" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 --upgrade --force-reinstall)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/pip.exe\" install fsspec==2025.10.0)",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/python.exe\" -c \"from main import app; print\\(''Backend imports successful!''\\)\")",
+      "Bash(\"D:/CTRL_ITERATION/flux-lora-pipeline/backend/venv/Scripts/python.exe\" main.py)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(gh auth status:*)",
+      "Bash(gh repo create:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(pkill -f \"cp -r\")",
+      "Bash(rsync:*)",
+      "Bash(find:*)",
+      "Bash(timeout 5 type:*)",
+      "Bash(ping:*)"
+    ]
+  }
+}

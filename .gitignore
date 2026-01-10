@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Models (too large for git)
+models/flux/
+models/refiners/*.pth
+models/loras/*/
+
+# Outputs
+outputs/generated/
+outputs/refined/
+outputs/liked/
+training_data/*
+!training_data/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+
+# Temp
+*.tmp
+.cache/

@@ -1,0 +1,41 @@
+# Model Paths Configuration
+# Uses existing models from StabilityMatrix/ComfyUI where available
+
+# StabilityMatrix/ComfyUI base path
+comfyui_base: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI"
+
+# Flux Models (GGUF format from ComfyUI)
+flux:
+  # Primary Flux model (FP16 GGUF - higher quality)
+  unet: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/unet/flux1-dev-F16.gguf"
+  # Alternative: Q8 quantized (smaller, slightly lower quality)
+  unet_q8: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/unet/flux1-dev-Q8_0.gguf"
+
+  # Text encoders
+  t5: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/clip/t5xxl_fp16.safetensors"
+  t5_fp8: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/clip/t5xxl_fp8_e4m3fn.safetensors"
+  clip_l: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/clip/clip_l.safetensors"
+
+  # VAE
+  vae: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/vae/ae.safetensors"
+
+# Upscale Models
+upscale:
+  # Best quality 4x upscalers
+  ultrasharp: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/upscale_models/4x-UltraSharp.pth"
+  remacri: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/upscale_models/4x_foolhardy_Remacri.pth"
+  nomos: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/upscale_models/4xNomos8kHAT-L_otf.pth"
+
+  # 8x upscalers
+  faces_8x: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/upscale_models/8x_NMKD-Faces_160000_G.pth"
+  super_8x: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/upscale_models/8x_NMKD-Superscale_150000_G.pth"
+
+  # Detail enhancement
+  skin_detail: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/upscale_models/1x-ITF-SkinDiffDetail-Lite-v1.pth"
+  deblur: "D:/COMFY UI/StabilityMatrix-win-x64/Data/Packages/ComfyUI/models/upscale_models/1x_DeBLR.pth"
+
+# Local paths for this project
+local:
+  loras: "D:/CTRL_ITERATION/flux-lora-pipeline/models/loras"
+  outputs: "D:/CTRL_ITERATION/flux-lora-pipeline/outputs"
+  training_data: "D:/CTRL_ITERATION/flux-lora-pipeline/training_data"

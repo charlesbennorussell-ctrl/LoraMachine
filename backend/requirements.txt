@@ -1,0 +1,40 @@
+# Core
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+websockets>=12.0
+pydantic>=2.5.0
+
+# ML/AI
+torch>=2.1.0
+torchvision>=0.16.0
+diffusers>=0.25.0
+transformers>=4.36.0
+accelerate>=0.25.0
+safetensors>=0.4.0
+xformers>=0.0.23
+bitsandbytes>=0.41.0
+
+# LoRA Training (SimpleTuner deps)
+peft>=0.7.0
+datasets>=2.16.0
+wandb>=0.16.0
+lycoris-lora>=2.0.0
+
+# Refinement - Real-ESRGAN
+realesrgan>=0.3.0
+basicsr>=1.4.2
+
+# Refinement - Qwen2-VL (optional)
+# qwen-vl-utils>=0.0.2  # Uncomment if using Qwen2-VL
+# flash-attn>=2.5.0  # Requires building from source on Windows
+
+# Utils
+pillow>=10.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+tqdm>=4.66.0
+huggingface-hub>=0.20.0
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+opencv-python>=4.8.0

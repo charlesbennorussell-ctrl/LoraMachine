@@ -1,0 +1,53 @@
+# Default LoRA Training Configuration
+# Optimized for NVIDIA RTX 4080 (16GB VRAM)
+
+# Basic Settings
+name: "my-lora"
+trigger_word: "ohwx"
+base_model: "black-forest-labs/FLUX.1-dev"
+
+# Training Parameters
+steps: 1000
+learning_rate: 0.0001
+batch_size: 1
+resolution: 1024
+gradient_accumulation_steps: 4
+warmup_steps: 100
+
+# LoRA Settings
+lora_rank: 16
+lora_alpha: 16
+lora_dropout: 0.0
+
+# Memory Optimization
+mixed_precision: "bf16"
+gradient_checkpointing: true
+use_8bit_adam: false
+
+# Validation
+save_every_n_steps: 500
+validation_prompt: "A photo of ohwx"
+
+# Presets for different use cases:
+#
+# Portrait/Person:
+#   steps: 1500
+#   trigger_word: "ohwx person"
+#   learning_rate: 0.0001
+#
+# Art Style:
+#   steps: 2000
+#   trigger_word: "in the style of ohwx"
+#   learning_rate: 0.00005
+#   lora_rank: 32
+#
+# Object:
+#   steps: 1000
+#   trigger_word: "ohwx"
+#   learning_rate: 0.0001
+#
+# Character:
+#   steps: 2000
+#   trigger_word: "ohwx character"
+#   lora_rank: 32
+#   lora_alpha: 32
