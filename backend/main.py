@@ -1,11 +1,12 @@
 import torch
 import os
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import shutil
@@ -14,6 +15,9 @@ import shutil
 os.environ['HF_HOME'] = 'D:/CTRL_ITERATION/flux-cache'
 os.environ['TRANSFORMERS_CACHE'] = 'D:/CTRL_ITERATION/flux-cache'
 os.environ['HF_DATASETS_CACHE'] = 'D:/CTRL_ITERATION/flux-cache'
+
+# Global thread pool for blocking operations
+_setup_executor = ThreadPoolExecutor(max_workers=1)
 
 from training.trainer import LoRATrainer
 from inference.generator import FluxGenerator
@@ -37,6 +41,7 @@ app.mount("/outputs", StaticFiles(directory=str(outputs_path)), name="outputs")
 
 # Global state
 training_status = {"active": False, "progress": 0, "message": "Idle"}
+setup_status = {"active": False, "ready": False, "progress": 0, "message": "Not initialized", "checks": {}}
 generation_queue = asyncio.Queue()
 connected_websockets: List[WebSocket] = []
 
@@ -183,7 +188,7 @@ async def list_training_images():
 
 
 @app.post("/train")
-async def start_training(config: TrainingConfig, background_tasks: BackgroundTasks):
+async def start_training(config: TrainingConfig):
     """Start LoRA training job"""
     global training_status
 
@@ -191,6 +196,12 @@ async def start_training(config: TrainingConfig, background_tasks: BackgroundTas
         global training_status
         training_status = {"active": True, "progress": 0, "message": "Initializing..."}
         await broadcast({"type": "training_status", "data": training_status})
+
+        async def progress_callback(p, m):
+            """Async progress callback that broadcasts to WebSocket clients"""
+            global training_status
+            training_status = {"active": True, "progress": p, "message": m}
+            await broadcast({"type": "training_status", "data": training_status})
 
         try:
             base_path = Path(__file__).parent.parent
@@ -203,9 +214,7 @@ async def start_training(config: TrainingConfig, background_tasks: BackgroundTas
                 batch_size=config.batch_size,
                 resolution=config.resolution,
                 trigger_word=config.trigger_word,
-                progress_callback=lambda p, m: asyncio.create_task(
-                    broadcast({"type": "training_status", "data": {"active": True, "progress": p, "message": m}})
-                )
+                progress_callback=progress_callback
             )
             training_status = {"active": False, "progress": 100, "message": "Complete!"}
         except Exception as e:
@@ -215,7 +224,8 @@ async def start_training(config: TrainingConfig, background_tasks: BackgroundTas
 
         await broadcast({"type": "training_status", "data": training_status})
 
-    background_tasks.add_task(lambda: asyncio.run(train_task()))
+    # Create task in the main event loop - NOT in a separate thread/loop
+    asyncio.create_task(train_task())
     return {"status": "Training started", "config": config.model_dump()}
 
 
@@ -242,7 +252,7 @@ async def generate_image(config: GenerationConfig):
 
 
 @app.post("/iterate")
-async def run_iteration(config: IterationConfig, background_tasks: BackgroundTasks):
+async def run_iteration(config: IterationConfig):
     """Run full LoRA strength iteration (0.1 to 1.0)"""
 
     async def iterate_task():
@@ -278,12 +288,13 @@ async def run_iteration(config: IterationConfig, background_tasks: BackgroundTas
 
         await broadcast({"type": "iteration_complete", "data": results})
 
-    background_tasks.add_task(lambda: asyncio.run(iterate_task()))
+    # Create task in the main event loop - NOT in a separate thread/loop
+    asyncio.create_task(iterate_task())
     return {"status": "Iteration started"}
 
 
 @app.post("/like/{image_id}")
-async def like_image(image_id: str, background_tasks: BackgroundTasks):
+async def like_image(image_id: str):
     """Mark image as liked and queue for refinement"""
     base_path = Path(__file__).parent.parent
     source = base_path / "outputs" / "generated" / image_id
@@ -312,7 +323,8 @@ async def like_image(image_id: str, background_tasks: BackgroundTasks):
                 }
             })
 
-        background_tasks.add_task(lambda: asyncio.run(refine_task()))
+        # Create task in the main event loop - NOT in a separate thread/loop
+        asyncio.create_task(refine_task())
         return {"status": "Liked and queued for refinement", "image_id": image_id}
 
     return {"error": "Image not found"}
@@ -388,9 +400,253 @@ async def get_status():
     """Get current system status"""
     return {
         "training": training_status,
+        "setup": setup_status,
         "gpu_available": torch.cuda.is_available(),
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "gpu_memory": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB" if torch.cuda.is_available() else None
+    }
+
+
+@app.get("/setup/status")
+async def get_setup_status():
+    """Get detailed setup status"""
+    return setup_status
+
+
+@app.post("/setup")
+async def run_setup():
+    """
+    Run pre-training setup: download models, verify GPU, run system checks.
+    This should be called before attempting to train.
+    """
+    global setup_status
+
+    if setup_status["active"]:
+        return {"status": "Setup already in progress", "setup": setup_status}
+
+    loop = asyncio.get_event_loop()
+
+    def sync_progress(p, m, checks=None):
+        """Thread-safe progress callback"""
+        global setup_status
+        setup_status = {
+            "active": True,
+            "ready": False,
+            "progress": p,
+            "message": m,
+            "checks": checks or setup_status.get("checks", {})
+        }
+        asyncio.run_coroutine_threadsafe(
+            broadcast({"type": "setup_status", "data": setup_status}),
+            loop
+        )
+
+    async def setup_task():
+        global setup_status
+
+        setup_status = {"active": True, "ready": False, "progress": 0, "message": "Starting setup...", "checks": {}}
+        await broadcast({"type": "setup_status", "data": setup_status})
+
+        try:
+            # Run blocking setup in thread pool
+            result = await loop.run_in_executor(
+                _setup_executor,
+                _run_setup_sync,
+                sync_progress
+            )
+
+            setup_status = {
+                "active": False,
+                "ready": result["success"],
+                "progress": 100,
+                "message": "Setup complete!" if result["success"] else f"Setup failed: {result.get('error', 'Unknown error')}",
+                "checks": result["checks"]
+            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            setup_status = {
+                "active": False,
+                "ready": False,
+                "progress": 0,
+                "message": f"Setup failed: {str(e)}",
+                "checks": setup_status.get("checks", {})
+            }
+
+        await broadcast({"type": "setup_status", "data": setup_status})
+
+    asyncio.create_task(setup_task())
+    return {"status": "Setup started"}
+
+
+def _run_setup_sync(progress_callback):
+    """
+    Synchronous setup that runs in a thread pool.
+    Downloads models and runs system checks.
+    """
+    checks = {}
+
+    # Check 1: GPU availability
+    progress_callback(5, "Checking GPU...", checks)
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        checks["gpu"] = {
+            "status": "ok",
+            "name": gpu_name,
+            "memory_gb": round(gpu_mem, 1),
+            "message": f"{gpu_name} with {gpu_mem:.1f}GB VRAM"
+        }
+        print(f"[SETUP] GPU: {gpu_name} ({gpu_mem:.1f}GB)")
+    else:
+        checks["gpu"] = {
+            "status": "warning",
+            "message": "No GPU detected - training will be very slow"
+        }
+        print("[SETUP] WARNING: No GPU detected")
+
+    # Check 2: Disk space on cache drive
+    progress_callback(10, "Checking disk space...", checks)
+    cache_dir = Path("D:/CTRL_ITERATION/flux-cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(cache_dir)
+        free_gb = free / 1024**3
+        checks["disk_space"] = {
+            "status": "ok" if free_gb > 50 else ("warning" if free_gb > 20 else "error"),
+            "free_gb": round(free_gb, 1),
+            "message": f"{free_gb:.1f}GB free on cache drive"
+        }
+        print(f"[SETUP] Disk space: {free_gb:.1f}GB free")
+    except Exception as e:
+        checks["disk_space"] = {
+            "status": "error",
+            "message": f"Could not check disk space: {str(e)}"
+        }
+
+    # Check 3: Download/verify Flux model
+    progress_callback(15, "Checking Flux model (this may take a while on first run)...", checks)
+
+    try:
+        from huggingface_hub import snapshot_download, hf_hub_download
+        from huggingface_hub.utils import LocalEntryNotFoundError
+
+        model_id = "black-forest-labs/FLUX.1-dev"
+        cache_dir_str = str(cache_dir)
+
+        # Check if model files exist
+        progress_callback(20, "Verifying model files...", checks)
+
+        # Try to download with progress tracking
+        def download_with_progress():
+            # This will download if not present, or verify if already cached
+            snapshot_download(
+                model_id,
+                cache_dir=cache_dir_str,
+                local_files_only=False,
+                resume_download=True
+            )
+
+        # Check model size/status first
+        progress_callback(25, "Downloading Flux model files (if needed)...", checks)
+        download_with_progress()
+
+        checks["flux_model"] = {
+            "status": "ok",
+            "message": "Flux.1-dev model ready"
+        }
+        print("[SETUP] Flux model: Ready")
+
+    except Exception as e:
+        error_msg = str(e)
+        if "401" in error_msg or "403" in error_msg:
+            checks["flux_model"] = {
+                "status": "error",
+                "message": "Authentication required - run 'huggingface-cli login' first"
+            }
+        else:
+            checks["flux_model"] = {
+                "status": "error",
+                "message": f"Model download failed: {error_msg[:100]}"
+            }
+        print(f"[SETUP] Flux model error: {e}")
+        return {"success": False, "checks": checks, "error": str(e)}
+
+    # Check 4: Load and test model
+    progress_callback(70, "Loading model for verification (this uses GPU memory)...", checks)
+
+    try:
+        from diffusers import FluxPipeline
+
+        print("[SETUP] Loading Flux pipeline for verification...")
+        pipeline = FluxPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-dev",
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir_str
+        )
+
+        progress_callback(85, "Moving model to GPU...", checks)
+        pipeline.to("cuda" if torch.cuda.is_available() else "cpu")
+
+        checks["model_load"] = {
+            "status": "ok",
+            "message": "Model loads successfully"
+        }
+        print("[SETUP] Model load: Success")
+
+        # Check 5: Quick inference test
+        progress_callback(90, "Running quick inference test...", checks)
+
+        try:
+            # Run a minimal test generation
+            with torch.no_grad():
+                # Just test that we can run forward pass - don't actually generate
+                test_output = pipeline(
+                    prompt="test",
+                    num_inference_steps=1,
+                    guidance_scale=0.0,
+                    height=64,
+                    width=64,
+                    output_type="latent"
+                )
+
+            checks["inference_test"] = {
+                "status": "ok",
+                "message": "Inference test passed"
+            }
+            print("[SETUP] Inference test: Passed")
+
+        except Exception as e:
+            checks["inference_test"] = {
+                "status": "warning",
+                "message": f"Inference test failed (may still work): {str(e)[:50]}"
+            }
+            print(f"[SETUP] Inference test warning: {e}")
+
+        # Cleanup
+        progress_callback(95, "Cleaning up...", checks)
+        del pipeline
+        torch.cuda.empty_cache()
+
+    except Exception as e:
+        checks["model_load"] = {
+            "status": "error",
+            "message": f"Model load failed: {str(e)[:100]}"
+        }
+        print(f"[SETUP] Model load error: {e}")
+        return {"success": False, "checks": checks, "error": str(e)}
+
+    # All checks passed
+    progress_callback(100, "Setup complete!", checks)
+
+    # Determine overall success
+    has_errors = any(c.get("status") == "error" for c in checks.values())
+
+    return {
+        "success": not has_errors,
+        "checks": checks
     }
 
 

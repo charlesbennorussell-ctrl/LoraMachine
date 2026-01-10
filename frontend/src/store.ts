@@ -24,15 +24,31 @@ interface TrainingStatus {
   message: string;
 }
 
+interface SetupCheck {
+  status: 'ok' | 'warning' | 'error';
+  message: string;
+  [key: string]: unknown;
+}
+
+interface SetupStatus {
+  active: boolean;
+  ready: boolean;
+  progress: number;
+  message: string;
+  checks: Record<string, SetupCheck>;
+}
+
 interface AppState {
   status: {
     training?: TrainingStatus;
+    setup?: SetupStatus;
   };
   generatedImages: GeneratedImage[];
   refinedImages: RefinedImage[];
   loras: LoRA[];
 
-  setStatus: (key: string, value: TrainingStatus) => void;
+  setStatus: (key: string, value: TrainingStatus | SetupStatus) => void;
+  setSetupStatus: (status: SetupStatus) => void;
   addGeneratedImage: (image: GeneratedImage) => void;
   clearGeneratedImages: () => void;
   likeImage: (path: string) => void;
@@ -48,6 +64,10 @@ export const useStore = create<AppState>((set) => ({
 
   setStatus: (key, value) => set((state) => ({
     status: { ...state.status, [key]: value }
+  })),
+
+  setSetupStatus: (status) => set((state) => ({
+    status: { ...state.status, setup: status }
   })),
 
   addGeneratedImage: (image) => set((state) => ({

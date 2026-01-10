@@ -1,6 +1,7 @@
 import torch
 from pathlib import Path
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 from PIL import Image
 import json
@@ -18,6 +19,7 @@ class LoRATrainer:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.pipeline = None
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
     async def train(
         self,
@@ -46,16 +48,50 @@ class LoRATrainer:
             trigger_word: Trigger word for the trained concept
             progress_callback: Async callback for progress updates
         """
+        # Store the event loop for callbacks from the thread
+        loop = asyncio.get_event_loop()
+
+        def sync_progress(p, m):
+            """Thread-safe progress callback that schedules on the main event loop"""
+            if progress_callback:
+                asyncio.run_coroutine_threadsafe(progress_callback(p, m), loop)
+
+        # Run the blocking training in a thread pool
+        await loop.run_in_executor(
+            self._executor,
+            self._train_sync,
+            name, training_dir, output_dir, steps, learning_rate,
+            batch_size, resolution, trigger_word, sync_progress
+        )
+
+        # Final callback after training completes
+        if progress_callback:
+            await progress_callback(100, "Training complete!")
+
+    def _train_sync(
+        self,
+        name: str,
+        training_dir: str,
+        output_dir: str,
+        steps: int,
+        learning_rate: float,
+        batch_size: int,
+        resolution: int,
+        trigger_word: str,
+        progress_callback: Callable
+    ):
+        """
+        Synchronous training implementation that runs in a thread pool.
+        This keeps heavy GPU/IO operations off the async event loop.
+        """
         from diffusers import FluxPipeline
-        from diffusers.utils import convert_state_dict_to_peft
         from peft import LoraConfig, get_peft_model
         import torchvision.transforms as transforms
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        if progress_callback:
-            await progress_callback(5, "Loading Flux pipeline...")
+        progress_callback(5, "Loading Flux pipeline...")
 
         # Load full pipeline (more efficient than loading components separately)
         print("Loading Flux pipeline for LoRA training...")
@@ -82,8 +118,7 @@ class LoRATrainer:
         text_encoder.eval()
         text_encoder_2.eval()
 
-        if progress_callback:
-            await progress_callback(15, "Configuring LoRA...")
+        progress_callback(15, "Configuring LoRA...")
 
         # Configure LoRA
         lora_config = LoraConfig(
@@ -108,8 +143,7 @@ class LoRATrainer:
         total_params = sum(p.numel() for p in transformer.parameters())
         print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
 
-        if progress_callback:
-            await progress_callback(20, "Preparing training data...")
+        progress_callback(20, "Preparing training data...")
 
         # Prepare dataset
         training_path = Path(training_dir)
@@ -144,8 +178,7 @@ class LoRATrainer:
             data.append({"image_path": str(img_path), "caption": caption})
             print(f"  - {img_path.name}: '{caption[:50]}...'")
 
-        if progress_callback:
-            await progress_callback(25, f"Starting training on {len(data)} images...")
+        progress_callback(25, f"Starting training on {len(data)} images...")
 
         # Optimizer
         optimizer = torch.optim.AdamW(
@@ -259,22 +292,16 @@ class LoRATrainer:
                     if step % 10 == 0:
                         avg_loss = sum(losses[-10:]) / min(len(losses), 10)
                         progress = 25 + int((step / steps) * 70)
-                        if progress_callback:
-                            await progress_callback(
-                                progress,
-                                f"Step {step}/{steps} - Loss: {avg_loss:.4f} - LR: {scheduler.get_last_lr()[0]:.2e}"
-                            )
-
-                    # Yield to event loop periodically
-                    if step % 5 == 0:
-                        await asyncio.sleep(0)
+                        progress_callback(
+                            progress,
+                            f"Step {step}/{steps} - Loss: {avg_loss:.4f} - LR: {scheduler.get_last_lr()[0]:.2e}"
+                        )
 
                 except Exception as e:
                     print(f"Error processing {item['image_path']}: {e}")
                     continue
 
-        if progress_callback:
-            await progress_callback(95, "Saving LoRA weights...")
+        progress_callback(95, "Saving LoRA weights...")
 
         # Save LoRA weights
         transformer.save_pretrained(output_path)
@@ -300,9 +327,6 @@ class LoRATrainer:
         # Cleanup
         del pipeline
         torch.cuda.empty_cache()
-
-        if progress_callback:
-            await progress_callback(100, "Training complete!")
 
         print(f"LoRA saved to: {output_path}")
         return str(output_path)

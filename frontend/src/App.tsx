@@ -14,6 +14,7 @@ function App() {
   const [activeTab, setActiveTab] = useState<TabType>('train');
   const {
     setStatus,
+    setSetupStatus,
     addGeneratedImage,
     addRefinedImage,
     setLoras,
@@ -33,6 +34,9 @@ function App() {
         case 'training_status':
           setStatus('training', lastMessage.data);
           break;
+        case 'setup_status':
+          setSetupStatus(lastMessage.data);
+          break;
         case 'iteration_progress':
           addGeneratedImage({
             path: lastMessage.data.path,
@@ -48,7 +52,7 @@ function App() {
           break;
       }
     }
-  }, [lastMessage, setStatus, addGeneratedImage, addRefinedImage]);
+  }, [lastMessage, setStatus, setSetupStatus, addGeneratedImage, addRefinedImage]);
 
   // Fetch initial data
   useEffect(() => {
@@ -59,6 +63,11 @@ function App() {
           name: status.gpu_name,
           available: status.gpu_available
         });
+
+        // Load setup status if available
+        if (status.setup) {
+          setSetupStatus(status.setup);
+        }
 
         const lorasData = await api.getLoras();
         setLoras(lorasData.loras);

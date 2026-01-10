@@ -33,6 +33,18 @@ export const api = {
     return res.json();
   },
 
+  async getSetupStatus() {
+    const res = await fetch(`${API_BASE}/setup/status`);
+    return res.json();
+  },
+
+  async runSetup() {
+    const res = await fetch(`${API_BASE}/setup`, {
+      method: 'POST'
+    });
+    return res.json();
+  },
+
   async uploadTrainingImages(formData: FormData) {
     const res = await fetch(`${API_BASE}/upload-training-images`, {
       method: 'POST',
