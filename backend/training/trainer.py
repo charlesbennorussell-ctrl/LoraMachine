@@ -6,6 +6,12 @@ from typing import Callable, Optional
 from PIL import Image
 import json
 import os
+import queue
+import threading
+
+# Disable xformers to prevent segfaults with incompatible triton
+os.environ["XFORMERS_DISABLED"] = "1"
+os.environ["DIFFUSERS_NO_XFORMERS"] = "1"
 
 
 class LoRATrainer:
@@ -48,21 +54,57 @@ class LoRATrainer:
             trigger_word: Trigger word for the trained concept
             progress_callback: Async callback for progress updates
         """
-        # Store the event loop for callbacks from the thread
-        loop = asyncio.get_event_loop()
+        # Use a queue-based approach to avoid event loop deadlocks
+        progress_queue = queue.Queue()
+        training_done = threading.Event()
+        training_error = [None]  # Use list to allow mutation from thread
 
         def sync_progress(p, m):
-            """Thread-safe progress callback that schedules on the main event loop"""
-            if progress_callback:
-                asyncio.run_coroutine_threadsafe(progress_callback(p, m), loop)
+            """Thread-safe progress callback using queue"""
+            progress_queue.put((p, m))
 
-        # Run the blocking training in a thread pool
-        await loop.run_in_executor(
-            self._executor,
-            self._train_sync,
-            name, training_dir, output_dir, steps, learning_rate,
-            batch_size, resolution, trigger_word, sync_progress
-        )
+        def run_training():
+            """Run training in background thread"""
+            try:
+                self._train_sync(
+                    name, training_dir, output_dir, steps, learning_rate,
+                    batch_size, resolution, trigger_word, sync_progress
+                )
+            except Exception as e:
+                training_error[0] = e
+            finally:
+                training_done.set()
+
+        # Start training in background thread
+        training_thread = threading.Thread(target=run_training, daemon=True)
+        training_thread.start()
+
+        # Poll for progress updates without blocking the event loop
+        while not training_done.is_set():
+            # Process any queued progress updates
+            while True:
+                try:
+                    p, m = progress_queue.get_nowait()
+                    if progress_callback:
+                        await progress_callback(p, m)
+                except queue.Empty:
+                    break
+
+            # Short async sleep to yield control
+            await asyncio.sleep(0.1)
+
+        # Process any remaining progress updates
+        while True:
+            try:
+                p, m = progress_queue.get_nowait()
+                if progress_callback:
+                    await progress_callback(p, m)
+            except queue.Empty:
+                break
+
+        # Check for errors
+        if training_error[0]:
+            raise training_error[0]
 
         # Final callback after training completes
         if progress_callback:
@@ -98,11 +140,69 @@ class LoRATrainer:
         # Use D: drive for cache to avoid C: drive space issues
         cache_dir = "D:/CTRL_ITERATION/flux-cache"
 
-        pipeline = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-dev",
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir
+        # Force disable memory-efficient attention to avoid xformers/triton segfaults
+        try:
+            import diffusers
+            diffusers.utils.is_xformers_available = lambda: False
+        except:
+            pass
+
+        # WORKAROUND: Load components individually to avoid Windows segfault
+        # FluxPipeline.from_pretrained() crashes on Windows when loading all components together
+        # But loading them one by one works fine
+        print("Loading Flux components individually (Windows workaround)...")
+        model_id = "black-forest-labs/FLUX.1-dev"
+
+        progress_callback(8, "Loading scheduler...")
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model_id, subfolder="scheduler", cache_dir=cache_dir
         )
+
+        progress_callback(10, "Loading VAE...")
+        from diffusers import AutoencoderKL
+        vae = AutoencoderKL.from_pretrained(
+            model_id, subfolder="vae", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+        )
+
+        progress_callback(12, "Loading CLIP text encoder...")
+        from transformers import CLIPTextModel, CLIPTokenizer
+        text_encoder = CLIPTextModel.from_pretrained(
+            model_id, subfolder="text_encoder", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+        )
+        tokenizer = CLIPTokenizer.from_pretrained(
+            model_id, subfolder="tokenizer", cache_dir=cache_dir
+        )
+
+        progress_callback(14, "Loading T5 text encoder...")
+        from transformers import T5EncoderModel, T5TokenizerFast
+        text_encoder_2 = T5EncoderModel.from_pretrained(
+            model_id, subfolder="text_encoder_2", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+        )
+        tokenizer_2 = T5TokenizerFast.from_pretrained(
+            model_id, subfolder="tokenizer_2", cache_dir=cache_dir
+        )
+
+        progress_callback(16, "Loading transformer (largest component)...")
+        from diffusers.models import FluxTransformer2DModel
+        transformer_model = FluxTransformer2DModel.from_pretrained(
+            model_id, subfolder="transformer", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+        )
+
+        progress_callback(18, "Assembling pipeline...")
+        pipeline = FluxPipeline(
+            scheduler=scheduler,
+            vae=vae,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            transformer=transformer_model
+        )
+        print("Pipeline assembled successfully!")
+
+        # Move to device step by step to avoid memory spikes
+        print("Moving pipeline to GPU...")
         pipeline.to(self.device)
 
         # Extract components
@@ -192,9 +292,10 @@ class LoRATrainer:
         from torch.optim.lr_scheduler import CosineAnnealingLR
         scheduler = CosineAnnealingLR(optimizer, T_max=steps, eta_min=learning_rate * 0.1)
 
-        # Helper function to encode prompts
+        # Helper function to encode prompts for Flux
+        # Flux uses CLIP for pooled embeddings and T5 for sequence embeddings
         def encode_prompt(prompt_text):
-            # Encode with CLIP
+            # Encode with CLIP for pooled projections
             text_inputs = tokenizer(
                 prompt_text,
                 padding="max_length",
@@ -205,9 +306,11 @@ class LoRATrainer:
             text_input_ids = text_inputs.input_ids.to(self.device)
 
             with torch.no_grad():
-                prompt_embeds = text_encoder(text_input_ids)[0]
+                clip_output = text_encoder(text_input_ids, output_hidden_states=False)
+                # Use pooler_output for pooled_projections (shape: [batch, hidden_dim])
+                pooled_projections = clip_output.pooler_output.to(dtype=torch.bfloat16)
 
-            # Encode with T5
+            # Encode with T5 for encoder_hidden_states
             text_inputs_2 = tokenizer_2(
                 prompt_text,
                 padding="max_length",
@@ -218,9 +321,29 @@ class LoRATrainer:
             text_input_ids_2 = text_inputs_2.input_ids.to(self.device)
 
             with torch.no_grad():
-                prompt_embeds_2 = text_encoder_2(text_input_ids_2)[0]
+                t5_output = text_encoder_2(text_input_ids_2)
+                # Use last_hidden_state for encoder_hidden_states (shape: [batch, seq, hidden_dim])
+                encoder_hidden_states = t5_output.last_hidden_state.to(dtype=torch.bfloat16)
 
-            return prompt_embeds, prompt_embeds_2
+            return pooled_projections, encoder_hidden_states
+
+        # Helper function to prepare latent image IDs (from FluxPipeline)
+        def prepare_latent_image_ids(batch_size, height, width, device, dtype):
+            """Generate positional IDs for the latent image patches."""
+            latent_image_ids = torch.zeros(height, width, 3, device=device, dtype=dtype)
+            latent_image_ids[..., 1] = torch.arange(height, device=device)[:, None]
+            latent_image_ids[..., 2] = torch.arange(width, device=device)[None, :]
+            latent_image_ids = latent_image_ids.reshape(-1, 3)
+            return latent_image_ids.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Helper function to pack latents for Flux (from FluxPipeline)
+        def pack_latents(latents, batch_size, num_channels, height, width):
+            """Pack latents from [B, C, H, W] to [B, H*W, C*patch_size*patch_size]."""
+            # Flux uses 2x2 patches
+            latents = latents.view(batch_size, num_channels, height // 2, 2, width // 2, 2)
+            latents = latents.permute(0, 2, 4, 1, 3, 5)
+            latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels * 4)
+            return latents
 
         # Training loop
         step = 0
@@ -242,7 +365,7 @@ class LoRATrainer:
                         latents = latents * vae.config.scaling_factor
 
                     # Encode text prompt
-                    prompt_embeds, prompt_embeds_2 = encode_prompt(item["caption"])
+                    pooled_projections, encoder_hidden_states = encode_prompt(item["caption"])
 
                     # Create random noise and timestep for flow matching
                     noise = torch.randn_like(latents)
@@ -259,22 +382,77 @@ class LoRATrainer:
                     # Target is the velocity: dx/dt = latents - noise
                     target = latents - noise
 
+                    # Get latent dimensions
+                    _, num_channels, height, width = noisy_latents.shape
+
+                    # Pack latents and target for Flux transformer
+                    packed_noisy_latents = pack_latents(noisy_latents, bsz, num_channels, height, width)
+                    packed_target = pack_latents(target, bsz, num_channels, height, width)
+
+                    # Generate image and text position IDs
+                    img_ids = prepare_latent_image_ids(bsz, height // 2, width // 2, self.device, torch.bfloat16)
+                    txt_ids = torch.zeros(bsz, encoder_hidden_states.shape[1], 3, device=self.device, dtype=torch.bfloat16)
+
                     # Forward pass through transformer
                     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                         # Prepare timestep conditioning
                         timestep_cond = t * 1000.0
 
-                        # Run transformer
-                        model_pred = transformer(
-                            hidden_states=noisy_latents,
-                            timestep=timestep_cond,
-                            encoder_hidden_states=prompt_embeds,
-                            pooled_projections=prompt_embeds_2,
-                            return_dict=False
-                        )[0]
+                        # Prepare guidance if the model uses guidance embeddings
+                        guidance = None
+                        try:
+                            base_config = getattr(transformer, 'config', None)
+                            if base_config is None and hasattr(transformer, 'base_model'):
+                                base_config = transformer.base_model.config
+                            if base_config is None and hasattr(transformer, 'get_base_model'):
+                                base_config = transformer.get_base_model().config
+                            if base_config and hasattr(base_config, 'guidance_embeds') and base_config.guidance_embeds:
+                                guidance = torch.full([bsz], 3.5, device=self.device, dtype=torch.float32)
+                        except Exception:
+                            pass
 
-                        # Flow matching loss
-                        loss = torch.nn.functional.mse_loss(model_pred, target)
+                        # Debug: Print shapes on first step
+                        if step == 0:
+                            print(f"DEBUG: packed_noisy_latents shape: {packed_noisy_latents.shape}")
+                            print(f"DEBUG: timestep_cond shape: {timestep_cond.shape}")
+                            print(f"DEBUG: encoder_hidden_states shape: {encoder_hidden_states.shape}")
+                            print(f"DEBUG: pooled_projections shape: {pooled_projections.shape}")
+                            print(f"DEBUG: img_ids shape: {img_ids.shape}")
+                            print(f"DEBUG: txt_ids shape: {txt_ids.shape}")
+                            print(f"DEBUG: guidance: {guidance}")
+
+                        output = transformer.forward(
+                            hidden_states=packed_noisy_latents,
+                            timestep=timestep_cond,
+                            encoder_hidden_states=encoder_hidden_states,
+                            pooled_projections=pooled_projections,
+                            img_ids=img_ids,
+                            txt_ids=txt_ids,
+                            guidance=guidance,
+                            return_dict=True
+                        )
+
+                        # Debug output on first step
+                        if step == 0:
+                            print(f"DEBUG: output type: {type(output)}")
+                            if output is not None:
+                                print(f"DEBUG: output keys/attrs: {dir(output)[:10]}")
+
+                        # Extract sample from output (handle both dict and tuple)
+                        if output is None:
+                            raise ValueError("Transformer forward() returned None!")
+                        if hasattr(output, 'sample'):
+                            model_pred = output.sample
+                        elif isinstance(output, tuple):
+                            model_pred = output[0]
+                        else:
+                            model_pred = output
+
+                        if model_pred is None:
+                            raise ValueError(f"model_pred is None! output type: {type(output)}")
+
+                        # Flow matching loss (use packed target)
+                        loss = torch.nn.functional.mse_loss(model_pred, packed_target)
 
                     optimizer.zero_grad()
                     loss.backward()

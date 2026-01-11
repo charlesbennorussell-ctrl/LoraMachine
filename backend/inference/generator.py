@@ -1,3 +1,9 @@
+import os
+
+# Disable xformers to prevent segfaults
+os.environ["XFORMERS_DISABLED"] = "1"
+os.environ["DIFFUSERS_NO_XFORMERS"] = "1"
+
 import torch
 from pathlib import Path
 from PIL import Image
@@ -29,11 +35,56 @@ class FluxGenerator:
 
             # Use D: drive for cache to avoid C: drive space issues
             cache_dir = "D:/CTRL_ITERATION/flux-cache"
+            model_id = "black-forest-labs/FLUX.1-dev"
 
-            self.pipeline = FluxPipeline.from_pretrained(
-                "black-forest-labs/FLUX.1-dev",
-                torch_dtype=torch.bfloat16,
-                cache_dir=cache_dir
+            # WORKAROUND: Load components individually to avoid Windows segfault
+            # FluxPipeline.from_pretrained() crashes on Windows when loading all components together
+            print("Loading Flux components individually (Windows workaround)...")
+
+            from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
+            from diffusers.models import FluxTransformer2DModel
+            from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+
+            print("  Loading scheduler...")
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model_id, subfolder="scheduler", cache_dir=cache_dir
+            )
+
+            print("  Loading VAE...")
+            vae = AutoencoderKL.from_pretrained(
+                model_id, subfolder="vae", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+            )
+
+            print("  Loading CLIP text encoder...")
+            text_encoder = CLIPTextModel.from_pretrained(
+                model_id, subfolder="text_encoder", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+            )
+            tokenizer = CLIPTokenizer.from_pretrained(
+                model_id, subfolder="tokenizer", cache_dir=cache_dir
+            )
+
+            print("  Loading T5 text encoder...")
+            text_encoder_2 = T5EncoderModel.from_pretrained(
+                model_id, subfolder="text_encoder_2", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+            )
+            tokenizer_2 = T5TokenizerFast.from_pretrained(
+                model_id, subfolder="tokenizer_2", cache_dir=cache_dir
+            )
+
+            print("  Loading transformer...")
+            transformer = FluxTransformer2DModel.from_pretrained(
+                model_id, subfolder="transformer", torch_dtype=torch.bfloat16, cache_dir=cache_dir
+            )
+
+            print("  Assembling pipeline...")
+            self.pipeline = FluxPipeline(
+                scheduler=scheduler,
+                vae=vae,
+                text_encoder=text_encoder,
+                text_encoder_2=text_encoder_2,
+                tokenizer=tokenizer,
+                tokenizer_2=tokenizer_2,
+                transformer=transformer
             )
 
             # Memory optimizations for 16GB VRAM
@@ -41,12 +92,9 @@ class FluxGenerator:
             self.pipeline.enable_vae_slicing()
             self.pipeline.enable_vae_tiling()
 
-            # Enable xformers if available
-            try:
-                self.pipeline.enable_xformers_memory_efficient_attention()
-                print("xformers enabled for memory-efficient attention")
-            except Exception as e:
-                print(f"xformers not available: {e}")
+            # NOTE: xformers disabled to prevent segfaults with incompatible triton
+            # Using PyTorch's native scaled_dot_product_attention instead
+            print("Using PyTorch native attention (xformers disabled for stability)")
 
             print("Flux pipeline loaded successfully!")
 
