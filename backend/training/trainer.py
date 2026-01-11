@@ -238,10 +238,30 @@ class LoRATrainer:
         transformer.to(self.device)
         transformer.train()
 
+        # CRITICAL: Enable gradient checkpointing to fit in 16GB VRAM
+        # Without this, the 12B model won't fit with gradients
+        print("Enabling gradient checkpointing for memory efficiency...")
+        # Try different methods depending on model version
+        base_model = transformer.get_base_model() if hasattr(transformer, 'get_base_model') else transformer
+        if hasattr(base_model, 'enable_gradient_checkpointing'):
+            base_model.enable_gradient_checkpointing()
+        elif hasattr(base_model, 'gradient_checkpointing_enable'):
+            base_model.gradient_checkpointing_enable()
+        elif hasattr(base_model, '_set_gradient_checkpointing'):
+            base_model._set_gradient_checkpointing(True)
+        else:
+            print("Warning: Could not enable gradient checkpointing - training may be slow or OOM")
+
         # Print trainable parameters
         trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in transformer.parameters())
         print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+
+        # Clear CUDA cache before training
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"VRAM before training: {torch.cuda.memory_allocated() / 1e9:.2f}GB allocated")
 
         progress_callback(20, "Preparing training data...")
 
@@ -466,8 +486,11 @@ class LoRATrainer:
                     losses.append(loss.item())
                     step += 1
 
-                    # Progress update every 10 steps
-                    if step % 10 == 0:
+                    # Print every step for debugging
+                    print(f"Step {step}/{steps} - Loss: {loss.item():.4f}")
+
+                    # Progress update every step (was every 10)
+                    if step % 1 == 0:
                         avg_loss = sum(losses[-10:]) / min(len(losses), 10)
                         progress = 25 + int((step / steps) * 70)
                         progress_callback(
