@@ -35,7 +35,7 @@ class LoRATrainer:
         steps: int = 1000,
         learning_rate: float = 1e-4,
         batch_size: int = 1,
-        resolution: int = 1024,
+        resolution: int = 512,  # Reduced to 512 for 16GB VRAM
         trigger_word: str = "ohwx",
         progress_callback: Optional[Callable] = None
     ):
@@ -239,9 +239,7 @@ class LoRATrainer:
         transformer.train()
 
         # CRITICAL: Enable gradient checkpointing to fit in 16GB VRAM
-        # Without this, the 12B model won't fit with gradients
         print("Enabling gradient checkpointing for memory efficiency...")
-        # Try different methods depending on model version
         base_model = transformer.get_base_model() if hasattr(transformer, 'get_base_model') else transformer
         if hasattr(base_model, 'enable_gradient_checkpointing'):
             base_model.enable_gradient_checkpointing()
@@ -250,7 +248,7 @@ class LoRATrainer:
         elif hasattr(base_model, '_set_gradient_checkpointing'):
             base_model._set_gradient_checkpointing(True)
         else:
-            print("Warning: Could not enable gradient checkpointing - training may be slow or OOM")
+            print("Warning: Could not enable gradient checkpointing")
 
         # Print trainable parameters
         trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
@@ -261,7 +259,15 @@ class LoRATrainer:
         import gc
         gc.collect()
         torch.cuda.empty_cache()
-        print(f"VRAM before training: {torch.cuda.memory_allocated() / 1e9:.2f}GB allocated")
+        torch.cuda.synchronize()
+
+        # Force aggressive memory cleanup
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        print(f"VRAM before training: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+        # Set memory allocation to be more conservative
+        torch.cuda.set_per_process_memory_fraction(0.95)  # Use max 95% of VRAM
 
         progress_callback(20, "Preparing training data...")
 
@@ -369,25 +375,46 @@ class LoRATrainer:
         step = 0
         losses = []
 
+        print("\n" + "="*70)
+        print("STARTING TRAINING LOOP")
+        print(f"Total steps: {steps}, Images: {len(data)}")
+        print("="*70 + "\n")
+
         while step < steps:
             for item in data:
                 if step >= steps:
                     break
 
                 try:
+                    print(f"\n{'='*70}")
+                    print(f"STEP {step+1}/{steps} - {Path(item['image_path']).name}")
+                    print(f"{'='*70}")
+                    print(f"[1/10] Loading image...")
+
                     # Load and preprocess image
                     img = Image.open(item["image_path"]).convert("RGB")
+                    print(f"[2/10] Transforming image...")
                     img_tensor = transform(img).unsqueeze(0).to(self.device, dtype=torch.bfloat16)
+                    print(f"        Shape: {img_tensor.shape}")
+                    torch.cuda.synchronize()
 
                     # Encode image to latent space
+                    print(f"[3/10] Encoding to latent space...")
                     with torch.no_grad():
                         latents = vae.encode(img_tensor).latent_dist.sample()
                         latents = latents * vae.config.scaling_factor
+                    print(f"        Latent shape: {latents.shape}")
+                    print(f"        VRAM: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
+                    torch.cuda.synchronize()
 
                     # Encode text prompt
+                    print(f"[4/10] Encoding caption: '{item['caption'][:40]}...'")
                     pooled_projections, encoder_hidden_states = encode_prompt(item["caption"])
+                    print(f"        Done. Pooled: {pooled_projections.shape}, Hidden: {encoder_hidden_states.shape}")
+                    torch.cuda.synchronize()
 
-                    # Create random noise and timestep for flow matching
+                    # Create random noise
+                    print(f"[5/10] Creating noise...")
                     noise = torch.randn_like(latents)
                     bsz = latents.shape[0]
 
@@ -406,14 +433,23 @@ class LoRATrainer:
                     _, num_channels, height, width = noisy_latents.shape
 
                     # Pack latents and target for Flux transformer
+                    print(f"[6/10] Packing latents...")
                     packed_noisy_latents = pack_latents(noisy_latents, bsz, num_channels, height, width)
                     packed_target = pack_latents(target, bsz, num_channels, height, width)
 
                     # Generate image and text position IDs
+                    print(f"[7/10] Generating position IDs...")
                     img_ids = prepare_latent_image_ids(bsz, height // 2, width // 2, self.device, torch.bfloat16)
                     txt_ids = torch.zeros(bsz, encoder_hidden_states.shape[1], 3, device=self.device, dtype=torch.bfloat16)
+                    # Remove batch dimension to fix deprecation warning
+                    img_ids = img_ids.squeeze(0)  # [4096, 3]
+                    txt_ids = txt_ids.squeeze(0)  # [512, 3]
+                    # Remove batch dimension to fix deprecation warning
+                    img_ids = img_ids.squeeze(0)  # [4096, 3]
+                    txt_ids = txt_ids.squeeze(0)  # [512, 3]
 
                     # Forward pass through transformer
+                    print(f"[8/10] FORWARD PASS - VRAM: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
                     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                         # Prepare timestep conditioning
                         timestep_cond = t * 1000.0
@@ -441,16 +477,45 @@ class LoRATrainer:
                             print(f"DEBUG: txt_ids shape: {txt_ids.shape}")
                             print(f"DEBUG: guidance: {guidance}")
 
+                        print(f"        Calling transformer.forward()...")
+                        print(f"          hidden_states: {packed_noisy_latents.shape}")
+                        print(f"          timestep: {timestep_cond.shape}")
+                        print(f"          guidance: {guidance}")
+
                         output = transformer.forward(
+
+
                             hidden_states=packed_noisy_latents,
+
+
                             timestep=timestep_cond,
+
+
                             encoder_hidden_states=encoder_hidden_states,
+
+
                             pooled_projections=pooled_projections,
+
+
                             img_ids=img_ids,
+
+
                             txt_ids=txt_ids,
+
+
                             guidance=guidance,
+
+
                             return_dict=True
+
+
                         )
+
+
+                        print(f"        Forward pass COMPLETE!")
+
+
+                        torch.cuda.synchronize()
 
                         # Debug output on first step
                         if step == 0:
@@ -549,7 +614,7 @@ class SimpleTunerWrapper:
         output_dir: str,
         steps: int = 1000,
         learning_rate: float = 1e-4,
-        resolution: int = 1024,
+        resolution: int = 512,  # Reduced to 512 for 16GB VRAM
         trigger_word: str = "ohwx",
         progress_callback: Optional[Callable] = None
     ):
