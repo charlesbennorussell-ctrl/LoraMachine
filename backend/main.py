@@ -33,7 +33,8 @@ os.environ['HF_DATASETS_CACHE'] = 'D:/CTRL_ITERATION/flux-cache'
 # Global thread pool for blocking operations
 _setup_executor = ThreadPoolExecutor(max_workers=1)
 
-from training.trainer import LoRATrainer
+# Use QLoRA trainer for 16GB VRAM compatibility
+from training.qlora_trainer import QLoRATrainer as LoRATrainer
 from inference.generator import FluxGenerator
 from inference.iterator import LoRAIterator
 from refinement.refiner import ImageRefiner
