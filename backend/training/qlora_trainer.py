@@ -22,10 +22,29 @@ import os
 import queue
 import threading
 import gc
+import sys
+import time
+from datetime import datetime
 
 # Disable xformers to prevent segfaults
 os.environ["XFORMERS_DISABLED"] = "1"
 os.environ["DIFFUSERS_NO_XFORMERS"] = "1"
+
+# Log file for real-time monitoring
+LOG_FILE = Path(__file__).parent.parent.parent / "training.log"
+
+def log(msg: str, flush: bool = True):
+    """Write to both console and log file with timestamp."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    print(line, flush=flush)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            if flush:
+                f.flush()
+    except:
+        pass
 
 
 class QLoRATrainer:
@@ -63,12 +82,26 @@ class QLoRATrainer:
         This method uses a queue-based approach to report progress without
         blocking the async event loop.
         """
+        # Clear log file at start
+        try:
+            with open(LOG_FILE, "w") as f:
+                f.write(f"=== Training Started: {datetime.now()} ===\n")
+        except:
+            pass
+
+        log(f"Starting QLoRA training: {name}")
+        log(f"Steps: {steps}, LR: {learning_rate}, Rank: {lora_rank}")
+
         progress_queue = queue.Queue()
         training_done = threading.Event()
         training_error = [None]
+        last_progress = [0, "Initializing..."]
 
         def sync_progress(p, m):
             progress_queue.put((p, m))
+            last_progress[0] = p
+            last_progress[1] = m
+            log(f"PROGRESS: {p}% - {m}")
 
         def run_training():
             try:
@@ -78,25 +111,39 @@ class QLoRATrainer:
                 )
             except Exception as e:
                 import traceback
-                traceback.print_exc()
+                error_msg = traceback.format_exc()
+                log(f"TRAINING ERROR: {error_msg}")
                 training_error[0] = e
             finally:
                 training_done.set()
+                log("Training thread finished")
 
         # Start training in background thread
         training_thread = threading.Thread(target=run_training, daemon=True)
         training_thread.start()
+        log("Training thread started")
 
-        # Poll for progress updates
+        # Poll for progress updates with shorter interval
+        poll_count = 0
         while not training_done.is_set():
+            # Process all queued updates
+            updates_processed = 0
             while True:
                 try:
                     p, m = progress_queue.get_nowait()
                     if progress_callback:
                         await progress_callback(p, m)
+                    updates_processed += 1
                 except queue.Empty:
                     break
-            await asyncio.sleep(0.1)
+
+            # Short sleep to allow event loop to process other tasks
+            await asyncio.sleep(0.05)
+            poll_count += 1
+
+            # Every 100 polls (~5 sec), log that we're still alive
+            if poll_count % 100 == 0:
+                log(f"[Heartbeat] Still training... Last: {last_progress[0]}% - {last_progress[1]}")
 
         # Process remaining updates
         while True:
@@ -108,10 +155,13 @@ class QLoRATrainer:
                 break
 
         if training_error[0]:
+            log(f"Training failed with error: {training_error[0]}")
             raise training_error[0]
 
         if progress_callback:
             await progress_callback(100, "Training complete!")
+
+        log("=== Training Complete ===")
 
     def _train_sync(
         self,
@@ -128,17 +178,21 @@ class QLoRATrainer:
     ):
         """Synchronous training implementation with QLoRA."""
 
+        log("=== _train_sync started ===")
         progress_callback(2, "Importing libraries...")
 
+        log("Importing transformers, diffusers, peft...")
         from transformers import BitsAndBytesConfig, CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
         from diffusers import FluxPipeline, AutoencoderKL, FlowMatchEulerDiscreteScheduler
         from diffusers.models import FluxTransformer2DModel
         from peft import LoraConfig, get_peft_model
         import bitsandbytes as bnb
         import torchvision.transforms as transforms
+        log("Imports complete")
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
+        log(f"Output path: {output_path}")
 
         # Phase 1: Pre-compute embeddings (VAE and text encoders on GPU temporarily)
         progress_callback(5, "Phase 1: Pre-computing embeddings...")
@@ -154,7 +208,7 @@ class QLoRATrainer:
         if len(image_files) == 0:
             raise ValueError(f"No training images found in {training_dir}")
 
-        print(f"Found {len(image_files)} training images")
+        log(f"Found {len(image_files)} training images")
 
         # Image preprocessing
         transform = transforms.Compose([
@@ -358,11 +412,14 @@ class QLoRATrainer:
 
         step = 0
         losses = []
+        start_time = time.time()
 
-        print("\n" + "=" * 70)
-        print(f"STARTING QLORA TRAINING - {steps} steps")
-        print(f"VRAM at start: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
-        print("=" * 70 + "\n")
+        log("")
+        log("=" * 70)
+        log(f"STARTING QLORA TRAINING - {steps} steps")
+        log(f"VRAM at start: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
+        log("=" * 70)
+        log("")
 
         transformer.train()
 
@@ -438,28 +495,43 @@ class QLoRATrainer:
                     losses.append(loss.item())
                     step += 1
 
-                    # Progress updates
-                    if step % 10 == 0 or step == 1:
+                    # Progress updates - every 5 steps for more responsive feedback
+                    if step % 5 == 0 or step == 1:
                         avg_loss = sum(losses[-10:]) / min(len(losses), 10)
                         vram = torch.cuda.memory_allocated() / 1e9
+                        elapsed = time.time() - start_time
+                        steps_per_sec = step / elapsed if elapsed > 0 else 0
+                        eta_sec = (steps - step) / steps_per_sec if steps_per_sec > 0 else 0
+                        eta_min = eta_sec / 60
+
                         progress = 38 + int((step / steps) * 55)
-                        progress_callback(
-                            progress,
-                            f"Step {step}/{steps} - Loss: {avg_loss:.4f} - VRAM: {vram:.1f}GB"
-                        )
-                        print(f"Step {step}/{steps} - Loss: {loss.item():.4f} - VRAM: {vram:.2f}GB")
+                        msg = f"Step {step}/{steps} | Loss: {avg_loss:.4f} | {steps_per_sec:.2f} it/s | ETA: {eta_min:.1f}m"
+                        progress_callback(progress, msg)
+                        log(f"STEP {step}/{steps} | Loss: {loss.item():.4f} | Avg: {avg_loss:.4f} | VRAM: {vram:.2f}GB | {steps_per_sec:.2f} it/s | ETA: {eta_min:.1f}m")
 
                 except torch.cuda.OutOfMemoryError as e:
-                    print(f"OOM at step {step}! Attempting recovery...")
+                    log(f"OOM at step {step}! Attempting recovery...")
                     gc.collect()
                     torch.cuda.empty_cache()
                     continue
                 except Exception as e:
-                    print(f"Error at step {step}: {e}")
+                    log(f"ERROR at step {step}: {e}")
+                    import traceback
+                    log(traceback.format_exc())
                     continue
+
+        # Training complete stats
+        total_time = time.time() - start_time
+        log("")
+        log("=" * 70)
+        log(f"TRAINING COMPLETE!")
+        log(f"Total time: {total_time/60:.1f} minutes")
+        log(f"Final avg loss: {sum(losses[-10:]) / min(len(losses), 10):.4f}")
+        log("=" * 70)
 
         # Save LoRA weights
         progress_callback(95, "Saving LoRA weights...")
+        log("Saving LoRA weights...")
 
         # Get the LoRA state dict only (not full model)
         from peft import get_peft_model_state_dict
