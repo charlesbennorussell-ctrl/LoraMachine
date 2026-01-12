@@ -3,22 +3,29 @@ import { TrainingPanel } from './components/TrainingPanel';
 import { GenerationGallery } from './components/GenerationGallery';
 import { IterationViewer } from './components/IterationViewer';
 import { RefinementQueue } from './components/RefinementQueue';
+import { LoRAManager } from './components/LoRAManager';
+import { ImageGrid } from './components/ImageGrid';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useStore } from './store';
 import { api } from './api/client';
-import { Cpu, Zap } from 'lucide-react';
+import { Cpu, Zap, Grid3X3 } from 'lucide-react';
 
-type TabType = 'train' | 'generate' | 'iterate' | 'refined';
+type TabType = 'train' | 'generate' | 'iterate' | 'refined' | 'loras';
 
 function App() {
-  const [activeTab, setActiveTab] = useState<TabType>('train');
+  const [activeTab, setActiveTab] = useState<TabType>('iterate');
+  const [selectedGridImage, setSelectedGridImage] = useState<string | null>(null);
   const {
     setStatus,
     setSetupStatus,
     addGeneratedImage,
+    addImg2ImgImage,
     addRefinedImage,
     setLoras,
-    clearGeneratedImages
+    clearImg2ImgImages,
+    setInputImage,
+    img2imgImages,
+    generatedImages
   } = useStore();
   const [gpuInfo, setGpuInfo] = useState<{ name: string | null; available: boolean }>({
     name: null,
@@ -47,12 +54,25 @@ function App() {
         case 'iteration_complete':
           // Already handled via iteration_progress
           break;
+        case 'img2img_iteration_progress':
+          addImg2ImgImage({
+            path: lastMessage.data.path,
+            creativity: lastMessage.data.creativity,
+            liked: false
+          });
+          break;
+        case 'img2img_iteration_complete':
+          // Already handled via img2img_iteration_progress
+          break;
+        case 'img2img_iteration_error':
+          console.error('Img2img iteration error:', lastMessage.data.error);
+          break;
         case 'refinement_complete':
           addRefinedImage(lastMessage.data);
           break;
       }
     }
-  }, [lastMessage, setStatus, setSetupStatus, addGeneratedImage, addRefinedImage]);
+  }, [lastMessage, setStatus, setSetupStatus, addGeneratedImage, addImg2ImgImage, addRefinedImage]);
 
   // Fetch initial data
   useEffect(() => {
@@ -95,11 +115,12 @@ function App() {
     { id: 'train', label: 'Train' },
     { id: 'generate', label: 'Generate' },
     { id: 'iterate', label: 'Iterate' },
-    { id: 'refined', label: 'Refined' }
+    { id: 'refined', label: 'Refined' },
+    { id: 'loras', label: 'LoRAs' }
   ];
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
+    <div className="h-screen flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden">
       {/* Header */}
       <header className="border-b border-zinc-800 px-6 py-4">
         <div className="flex items-center justify-between max-w-7xl mx-auto">
@@ -154,13 +175,57 @@ function App() {
         </div>
       </nav>
 
-      {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-6 py-8">
-        {activeTab === 'train' && <TrainingPanel />}
-        {activeTab === 'generate' && <GenerationGallery />}
-        {activeTab === 'iterate' && <IterationViewer onClearImages={clearGeneratedImages} />}
-        {activeTab === 'refined' && <RefinementQueue />}
-      </main>
+      {/* Main Content - 2 Column Layout (30% controls, 70% grid) */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Left Column - Controls (30%) */}
+        <main className="w-[30%] min-w-[320px] overflow-y-auto px-4 py-6 border-r border-zinc-800">
+          <div>
+            {activeTab === 'train' && <TrainingPanel />}
+            {activeTab === 'generate' && <GenerationGallery />}
+            {activeTab === 'iterate' && (
+              <IterationViewer
+                onClearImages={clearImg2ImgImages}
+                selectedImage={selectedGridImage}
+                onUseSelectedImage={(path) => {
+                  // Convert grid image to input image for iteration
+                  setInputImage({
+                    path: path,
+                    url: `http://localhost:8000${path}`
+                  });
+                  setSelectedGridImage(null);
+                }}
+              />
+            )}
+            {activeTab === 'refined' && <RefinementQueue />}
+            {activeTab === 'loras' && <LoRAManager />}
+          </div>
+        </main>
+
+        {/* Right Column - Image Grid (Always visible) */}
+        <aside className="w-80 border-l border-zinc-800 bg-zinc-900/50 flex flex-col">
+          <div className="flex items-center gap-2 px-4 py-3 border-b border-zinc-800">
+            <Grid3X3 className="w-4 h-4 text-zinc-500" />
+            <span className="text-sm font-medium text-zinc-300">
+              Results ({img2imgImages.length + generatedImages.length})
+            </span>
+          </div>
+          <div className="flex-1 overflow-hidden">
+            <ImageGrid
+              onSelectImage={(path) => {
+                setSelectedGridImage(path);
+                // If on iterate tab, also set as input
+                if (activeTab === 'iterate') {
+                  setInputImage({
+                    path: path,
+                    url: `http://localhost:8000${path}`
+                  });
+                }
+              }}
+              selectedImage={selectedGridImage}
+            />
+          </div>
+        </aside>
+      </div>
     </div>
   );
 }

@@ -215,7 +215,7 @@ export function TrainingPanel() {
               <span>{uploadedFiles.length} images uploaded</span>
             </div>
             <div className="grid grid-cols-6 gap-2">
-              {uploadedFiles.slice(0, 12).map((file, idx) => (
+              {uploadedFiles.slice(0, 12).map((_, idx) => (
                 <div
                   key={idx}
                   className="aspect-square bg-zinc-800 rounded-lg overflow-hidden"

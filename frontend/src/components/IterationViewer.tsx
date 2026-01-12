@@ -1,47 +1,108 @@
-import { useState } from 'react';
-import { Play, Heart, Loader2, Trash2, RefreshCw } from 'lucide-react';
+import { useState, useCallback, useEffect } from 'react';
+import { Play, Heart, Loader2, Trash2, RefreshCw, Upload, X, ImageIcon } from 'lucide-react';
+import { useDropzone } from 'react-dropzone';
 import { api } from '../api/client';
 import { useStore } from '../store';
 
 interface IterationViewerProps {
   onClearImages: () => void;
+  selectedImage?: string | null;
+  onUseSelectedImage?: (path: string) => void;
 }
 
-export function IterationViewer({ onClearImages }: IterationViewerProps) {
+export function IterationViewer({ onClearImages, selectedImage, onUseSelectedImage }: IterationViewerProps) {
   const [config, setConfig] = useState({
     prompt: '',
     negative_prompt: '',
     lora_path: '',
+    lora_strength: 1.0,  // Full LoRA influence
     steps: 28,
     guidance_scale: 3.5,
     width: 1024,
     height: 1024,
     seed: null as number | null,
-    strength_start: 0.1,
-    strength_end: 1.0,
-    strength_step: 0.1
+    // 5 versions at different creativity levels (0.0 doesn't work - results in 0 steps)
+    creativity_values: [0.1, 0.3, 0.5, 0.7, 0.9]
   });
   const [isRunning, setIsRunning] = useState(false);
-  const { generatedImages, likeImage, loras } = useStore();
+  const [isUploading, setIsUploading] = useState(false);
+  const [iterationImages, setIterationImages] = useState<Array<{ path: string; creativity: number; liked?: boolean }>>([]);
+  const { likeImage, loras, inputImage, setInputImage, clearImg2ImgImages, img2imgImages } = useStore();
+
+  // Sync local state with store (WebSocket updates go to store via App.tsx)
+  useEffect(() => {
+    if (img2imgImages.length > 0 && isRunning) {
+      setIterationImages(img2imgImages.map(img => ({
+        path: img.path,
+        creativity: img.creativity || 0,
+        liked: img.liked
+      })));
+      // Check if iteration is complete
+      if (img2imgImages.length >= config.creativity_values.length) {
+        setIsRunning(false);
+      }
+    }
+  }, [img2imgImages, isRunning, config.creativity_values.length]);
+
+  // Handle input image upload
+  const onDrop = useCallback(async (acceptedFiles: File[]) => {
+    if (acceptedFiles.length === 0) return;
+
+    setIsUploading(true);
+    try {
+      const result = await api.uploadInputImage(acceptedFiles[0]);
+      setInputImage({ path: result.path, url: result.url });
+    } catch (error) {
+      console.error('Failed to upload input image:', error);
+    }
+    setIsUploading(false);
+  }, [setInputImage]);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: {
+      'image/*': ['.png', '.jpg', '.jpeg', '.webp']
+    },
+    maxFiles: 1
+  });
 
   const runIteration = async () => {
-    if (!config.prompt || !config.lora_path) return;
+    if (!config.prompt || !config.lora_path || !inputImage) return;
 
-    onClearImages(); // Clear previous results
+    setIterationImages([]); // Clear previous results
+    clearImg2ImgImages();
     setIsRunning(true);
+
     try {
-      await api.runIteration(config);
+      await api.runImg2ImgIteration({
+        prompt: config.prompt,
+        negative_prompt: config.negative_prompt,
+        lora_path: config.lora_path,
+        lora_strength: config.lora_strength,
+        steps: config.steps,
+        guidance_scale: config.guidance_scale,
+        width: config.width,
+        height: config.height,
+        seed: config.seed,
+        creativity_values: config.creativity_values
+      }, inputImage.path);
     } catch (error) {
       console.error('Iteration failed:', error);
+      setIsRunning(false);
     }
-    setIsRunning(false);
   };
+
+  // Note: WebSocket updates are handled in App.tsx via useWebSocket hook
+  // This component uses the store to receive updates
 
   const handleLike = async (imagePath: string) => {
     const imageId = imagePath.split('/').pop() || '';
     try {
       await api.likeImage(imageId);
       likeImage(imagePath);
+      setIterationImages(prev =>
+        prev.map(img => img.path === imagePath ? { ...img, liked: true } : img)
+      );
     } catch (error) {
       console.error('Failed to like image:', error);
     }
@@ -51,17 +112,77 @@ export function IterationViewer({ onClearImages }: IterationViewerProps) {
     setConfig(c => ({ ...c, seed: Math.floor(Math.random() * 2147483647) }));
   };
 
-  // Filter to only iteration images (those with strength)
-  const iterationImages = generatedImages.filter(img => img.strength !== undefined);
+  const clearInputImage = () => {
+    setInputImage(null);
+  };
 
-  // Calculate how many images are expected
-  const expectedCount = Math.round((config.strength_end - config.strength_start) / config.strength_step) + 1;
+  const clearResults = () => {
+    setIterationImages([]);
+    clearImg2ImgImages();
+    onClearImages();
+  };
+
+  // Sort by creativity
+  const sortedImages = [...iterationImages].sort((a, b) => a.creativity - b.creativity);
 
   return (
     <div className="space-y-8">
+      {/* Input Image Upload */}
+      <section className="max-w-3xl">
+        <h2 className="text-lg font-medium mb-4">Iterate Creativity Levels (Img2Img)</h2>
+        <p className="text-sm text-zinc-400 mb-4">
+          Generate 5 versions of your input image at different creativity levels (0.0, 0.2, 0.4, 0.6, 0.8).
+          Lower creativity stays closer to your input, higher allows more transformation.
+        </p>
+
+        {!inputImage ? (
+          <div
+            {...getRootProps()}
+            className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors
+              ${isDragActive
+                ? 'border-violet-500 bg-violet-500/10'
+                : 'border-zinc-700 hover:border-zinc-500 bg-zinc-900/50'
+              }`}
+          >
+            <input {...getInputProps()} />
+            {isUploading ? (
+              <div className="flex flex-col items-center gap-3">
+                <Loader2 className="w-8 h-8 animate-spin text-violet-500" />
+                <p className="text-zinc-400">Uploading...</p>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center gap-3">
+                <Upload className="w-8 h-8 text-zinc-500" />
+                <p className="text-zinc-300">
+                  {isDragActive ? 'Drop image here' : 'Drag & drop an input image, or click to browse'}
+                </p>
+                <p className="text-xs text-zinc-500">PNG, JPG, WEBP up to 10MB</p>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="relative inline-block">
+            <img
+              src={api.getImageUrl(inputImage.url)}
+              alt="Input image"
+              className="max-w-sm rounded-lg border border-zinc-700"
+            />
+            <button
+              onClick={clearInputImage}
+              className="absolute -top-2 -right-2 p-1 bg-red-500 hover:bg-red-400 rounded-full transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <div className="absolute bottom-2 left-2 px-2 py-1 bg-black/70 rounded text-xs text-zinc-300">
+              Input Image
+            </div>
+          </div>
+        )}
+      </section>
+
       {/* Config */}
       <section className="max-w-3xl">
-        <h2 className="text-lg font-medium mb-4">Iteration Settings</h2>
+        <h3 className="text-md font-medium mb-4">Iteration Settings</h3>
         <div className="space-y-4">
           <div>
             <label className="block text-sm text-zinc-400 mb-1.5">Select LoRA</label>
@@ -104,53 +225,48 @@ export function IterationViewer({ onClearImages }: IterationViewerProps) {
             />
           </div>
 
-          {/* Strength Range */}
-          <div className="p-4 bg-zinc-900/50 rounded-lg border border-zinc-800">
-            <h3 className="text-sm font-medium text-zinc-300 mb-3">LoRA Strength Range</h3>
-            <div className="grid grid-cols-3 gap-4">
-              <div>
-                <label className="block text-xs text-zinc-500 mb-1">Start</label>
-                <input
-                  type="number"
-                  min="0"
-                  max="1"
-                  step="0.1"
-                  value={config.strength_start}
-                  onChange={e => setConfig(c => ({ ...c, strength_start: parseFloat(e.target.value) || 0.1 }))}
-                  className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-sm
-                    focus:outline-none focus:ring-2 focus:ring-violet-500"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-zinc-500 mb-1">End</label>
-                <input
-                  type="number"
-                  min="0"
-                  max="1"
-                  step="0.1"
-                  value={config.strength_end}
-                  onChange={e => setConfig(c => ({ ...c, strength_end: parseFloat(e.target.value) || 1.0 }))}
-                  className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-sm
-                    focus:outline-none focus:ring-2 focus:ring-violet-500"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-zinc-500 mb-1">Step</label>
-                <input
-                  type="number"
-                  min="0.05"
-                  max="0.5"
-                  step="0.05"
-                  value={config.strength_step}
-                  onChange={e => setConfig(c => ({ ...c, strength_step: parseFloat(e.target.value) || 0.1 }))}
-                  className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-sm
-                    focus:outline-none focus:ring-2 focus:ring-violet-500"
-                />
-              </div>
+          {/* Creativity Levels Preview */}
+          <div className="p-4 bg-violet-900/20 border border-violet-700/30 rounded-lg">
+            <h3 className="text-sm font-medium text-violet-300 mb-3">Creativity Sweep</h3>
+            <div className="flex gap-2 mb-2">
+              {config.creativity_values.map((val, idx) => (
+                <div
+                  key={idx}
+                  className="flex-1 text-center py-2 rounded bg-zinc-800 text-sm font-medium"
+                  style={{
+                    backgroundColor: `hsla(${260 - val * 100}, 70%, 30%, 0.5)`
+                  }}
+                >
+                  {val.toFixed(1)}
+                </div>
+              ))}
             </div>
-            <p className="text-xs text-zinc-500 mt-2">
-              Will generate {expectedCount} images at strengths: {config.strength_start.toFixed(1)} to {config.strength_end.toFixed(1)}
+            <p className="text-xs text-zinc-400">
+              Will generate 5 images at creativity levels: 0.1 (subtle) to 0.9 (creative)
             </p>
+          </div>
+
+          {/* LoRA Strength Slider */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-sm text-zinc-400">LoRA Strength (fixed at full for all)</label>
+              <span className="text-sm font-medium text-zinc-300">{config.lora_strength.toFixed(2)}</span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={config.lora_strength}
+              onChange={e => setConfig(c => ({ ...c, lora_strength: parseFloat(e.target.value) }))}
+              className="w-full h-2 bg-zinc-800 rounded-lg appearance-none cursor-pointer
+                [&::-webkit-slider-thumb]:appearance-none
+                [&::-webkit-slider-thumb]:w-4
+                [&::-webkit-slider-thumb]:h-4
+                [&::-webkit-slider-thumb]:bg-violet-500
+                [&::-webkit-slider-thumb]:rounded-full
+                [&::-webkit-slider-thumb]:cursor-pointer"
+            />
           </div>
 
           <div className="grid grid-cols-4 gap-4">
@@ -230,26 +346,26 @@ export function IterationViewer({ onClearImages }: IterationViewerProps) {
         <div className="flex gap-3 mt-6">
           <button
             onClick={runIteration}
-            disabled={isRunning || !config.prompt || !config.lora_path}
+            disabled={isRunning || !config.prompt || !config.lora_path || !inputImage}
             className="flex items-center gap-2 px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500
               disabled:opacity-50 disabled:cursor-not-allowed rounded-lg font-medium transition-colors"
           >
             {isRunning ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Generating {iterationImages.length}/{expectedCount}...
+                Generating {iterationImages.length}/{config.creativity_values.length}...
               </>
             ) : (
               <>
                 <Play className="w-4 h-4" />
-                Run Full Iteration
+                Run 5 Iterations
               </>
             )}
           </button>
 
           {iterationImages.length > 0 && (
             <button
-              onClick={onClearImages}
+              onClick={clearResults}
               className="flex items-center gap-2 px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700
                 rounded-lg transition-colors text-zinc-400 hover:text-zinc-200"
             >
@@ -258,36 +374,41 @@ export function IterationViewer({ onClearImages }: IterationViewerProps) {
             </button>
           )}
         </div>
+
+        {!inputImage && (
+          <p className="text-sm text-amber-400 mt-2">
+            <ImageIcon className="w-4 h-4 inline mr-1" />
+            Upload an input image above to enable iteration
+          </p>
+        )}
       </section>
 
       {/* Results Grid */}
-      {iterationImages.length > 0 && (
+      {sortedImages.length > 0 && (
         <section>
           <h2 className="text-lg font-medium mb-4">
-            Iteration Results
+            Creativity Sweep Results
             <span className="text-zinc-500 font-normal ml-2">
-              ({iterationImages.length} images, LoRA Strength: {config.strength_start.toFixed(1)} to {config.strength_end.toFixed(1)})
+              ({sortedImages.length} images)
             </span>
           </h2>
           <div className="grid grid-cols-5 gap-4">
-            {iterationImages
-              .sort((a, b) => (a.strength || 0) - (b.strength || 0))
-              .map((img, idx) => (
+            {sortedImages.map((img, idx) => (
               <div key={idx} className="group relative">
                 <img
                   src={api.getImageUrl(img.path)}
-                  alt={`Strength ${img.strength}`}
+                  alt={`Creativity ${img.creativity}`}
                   className="w-full aspect-square object-cover rounded-lg"
                 />
-                {/* Strength indicator */}
+                {/* Creativity indicator */}
                 <div
                   className="absolute top-2 left-2 px-2 py-0.5 rounded text-xs font-medium"
                   style={{
-                    backgroundColor: `hsl(${120 - (img.strength || 0) * 120}, 70%, 40%)`,
+                    backgroundColor: `hsla(${260 - img.creativity * 200}, 70%, 40%, 0.9)`,
                     color: 'white'
                   }}
                 >
-                  {img.strength?.toFixed(1)}
+                  {img.creativity.toFixed(1)}
                 </div>
 
                 {/* Hover overlay */}
@@ -295,7 +416,7 @@ export function IterationViewer({ onClearImages }: IterationViewerProps) {
                   opacity-0 group-hover:opacity-100 transition-opacity rounded-lg">
                   <div className="absolute bottom-0 left-0 right-0 p-3 flex items-center justify-between">
                     <span className="text-sm font-medium">
-                      Strength: {img.strength?.toFixed(2)}
+                      Creativity: {img.creativity.toFixed(2)}
                     </span>
                     <button
                       onClick={() => handleLike(img.path)}
@@ -320,21 +441,21 @@ export function IterationViewer({ onClearImages }: IterationViewerProps) {
             ))}
           </div>
 
-          {/* Strength legend */}
+          {/* Creativity legend */}
           <div className="mt-6 p-4 bg-zinc-900/50 rounded-lg border border-zinc-800">
-            <h3 className="text-sm font-medium text-zinc-300 mb-2">Understanding LoRA Strength</h3>
+            <h3 className="text-sm font-medium text-zinc-300 mb-2">Understanding Creativity Levels</h3>
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
-                <div className="w-4 h-4 rounded" style={{ backgroundColor: 'hsl(120, 70%, 40%)' }} />
-                <span className="text-sm text-zinc-400">Low (0.1-0.3): Subtle influence</span>
+                <div className="w-4 h-4 rounded" style={{ backgroundColor: 'hsla(260, 70%, 40%, 0.9)' }} />
+                <span className="text-sm text-zinc-400">0.1: Very close to input</span>
               </div>
               <div className="flex items-center gap-2">
-                <div className="w-4 h-4 rounded" style={{ backgroundColor: 'hsl(60, 70%, 40%)' }} />
-                <span className="text-sm text-zinc-400">Medium (0.4-0.6): Balanced</span>
+                <div className="w-4 h-4 rounded" style={{ backgroundColor: 'hsla(200, 70%, 40%, 0.9)' }} />
+                <span className="text-sm text-zinc-400">0.5: Balanced transformation</span>
               </div>
               <div className="flex items-center gap-2">
-                <div className="w-4 h-4 rounded" style={{ backgroundColor: 'hsl(0, 70%, 40%)' }} />
-                <span className="text-sm text-zinc-400">High (0.7-1.0): Strong influence</span>
+                <div className="w-4 h-4 rounded" style={{ backgroundColor: 'hsla(100, 70%, 40%, 0.9)' }} />
+                <span className="text-sm text-zinc-400">0.9: More creative freedom</span>
               </div>
             </div>
           </div>

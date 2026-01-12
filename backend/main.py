@@ -37,6 +37,7 @@ _setup_executor = ThreadPoolExecutor(max_workers=1)
 from training.qlora_trainer import QLoRATrainer as LoRATrainer
 from inference.generator import FluxGenerator
 from inference.iterator import LoRAIterator
+from inference.img2img_generator import FluxImg2ImgGenerator
 from refinement.refiner import ImageRefiner
 
 app = FastAPI(title="Flux LoRA Pipeline")
@@ -54,6 +55,16 @@ outputs_path = Path(__file__).parent.parent / "outputs"
 outputs_path.mkdir(parents=True, exist_ok=True)
 app.mount("/outputs", StaticFiles(directory=str(outputs_path)), name="outputs")
 
+# Mount inputs folder for uploaded input images
+inputs_path = Path(__file__).parent.parent / "inputs"
+inputs_path.mkdir(parents=True, exist_ok=True)
+app.mount("/inputs", StaticFiles(directory=str(inputs_path)), name="inputs")
+
+# Mount models folder for LoRA thumbnails
+models_path = Path(__file__).parent.parent / "models"
+models_path.mkdir(parents=True, exist_ok=True)
+app.mount("/models", StaticFiles(directory=str(models_path)), name="models")
+
 # Global state
 training_status = {"active": False, "progress": 0, "message": "Idle"}
 setup_status = {"active": False, "ready": False, "progress": 0, "message": "Not initialized", "checks": {}}
@@ -65,6 +76,7 @@ trainer: Optional[LoRATrainer] = None
 generator: Optional[FluxGenerator] = None
 iterator: Optional[LoRAIterator] = None
 refiner: Optional[ImageRefiner] = None
+img2img_generator: Optional[FluxImg2ImgGenerator] = None
 
 
 def get_trainer():
@@ -93,6 +105,13 @@ def get_refiner():
     if refiner is None:
         refiner = ImageRefiner()
     return refiner
+
+
+def get_img2img_generator():
+    global img2img_generator
+    if img2img_generator is None:
+        img2img_generator = FluxImg2ImgGenerator()
+    return img2img_generator
 
 
 class TrainingConfig(BaseModel):
@@ -128,6 +147,42 @@ class IterationConfig(BaseModel):
     strength_start: float = 0.1
     strength_end: float = 1.0
     strength_step: float = 0.1
+
+
+class Img2ImgGenerationConfig(BaseModel):
+    """Config for img2img generation with LoRA and creativity control"""
+    prompt: str
+    negative_prompt: str = ""
+    lora_path: str
+    lora_strength: float = 1.0  # LoRA influence (keep at 1.0 for full style)
+    creativity: float = 0.5  # Denoising strength - how much to change from input
+    steps: int = 28
+    guidance_scale: float = 3.5
+    width: int = 1024
+    height: int = 1024
+    seed: Optional[int] = None
+
+
+class Img2ImgIterationConfig(BaseModel):
+    """Config for img2img iteration with 5 creativity levels"""
+    prompt: str
+    negative_prompt: str = ""
+    lora_path: str
+    lora_strength: float = 1.0  # LoRA influence (keep at 1.0 for full style)
+    steps: int = 28
+    guidance_scale: float = 3.5
+    width: int = 1024
+    height: int = 1024
+    seed: Optional[int] = None
+    # Default: 5 versions at 0.1, 0.3, 0.5, 0.7, 0.9 creativity (0.0 causes 0 steps error)
+    creativity_values: List[float] = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+
+class LoRAUpdateConfig(BaseModel):
+    """Config for updating LoRA metadata"""
+    name: Optional[str] = None
+    trigger_word: Optional[str] = None
+    description: Optional[str] = None
 
 
 @app.websocket("/ws")
@@ -347,8 +402,9 @@ async def like_image(image_id: str):
 
 @app.get("/loras")
 async def list_loras():
-    """List available trained LoRAs"""
-    lora_dir = Path(__file__).parent.parent / "models" / "loras"
+    """List available trained LoRAs with thumbnails"""
+    base_path = Path(__file__).parent.parent
+    lora_dir = base_path / "models" / "loras"
     loras = []
     if lora_dir.exists():
         for lora_path in lora_dir.iterdir():
@@ -356,12 +412,294 @@ async def list_loras():
                 # Check for config or adapter files
                 has_config = (lora_path / "config.json").exists() or \
                            (lora_path / "adapter_config.json").exists()
+
+                # Look for thumbnail
+                thumbnail = None
+                for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                    thumb_path = lora_path / f"thumbnail{ext}"
+                    if thumb_path.exists():
+                        rel_path = str(thumb_path.relative_to(base_path))
+                        thumbnail = "/" + rel_path.replace("\\", "/")
+                        break
+
+                # Load metadata if exists
+                metadata = {}
+                meta_path = lora_path / "lora_metadata.json"
+                if meta_path.exists():
+                    try:
+                        metadata = json.loads(meta_path.read_text())
+                    except Exception:
+                        pass
+
                 loras.append({
                     "name": lora_path.name,
                     "path": str(lora_path),
-                    "valid": has_config
+                    "valid": has_config,
+                    "thumbnail": thumbnail,
+                    "trigger_word": metadata.get("trigger_word", "ohwx"),
+                    "description": metadata.get("description", ""),
+                    "created_at": metadata.get("created_at"),
                 })
     return {"loras": loras}
+
+
+@app.get("/loras/{lora_name}")
+async def get_lora_details(lora_name: str):
+    """Get detailed info about a specific LoRA"""
+    base_path = Path(__file__).parent.parent
+    lora_path = base_path / "models" / "loras" / lora_name
+
+    if not lora_path.exists():
+        return {"error": "LoRA not found"}
+
+    # Check for config
+    has_config = (lora_path / "config.json").exists() or \
+                 (lora_path / "adapter_config.json").exists()
+
+    # Load metadata
+    metadata = {}
+    meta_path = lora_path / "lora_metadata.json"
+    if meta_path.exists():
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except Exception:
+            pass
+
+    # Look for thumbnail
+    thumbnail = None
+    for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+        thumb_path = lora_path / f"thumbnail{ext}"
+        if thumb_path.exists():
+            rel_path = str(thumb_path.relative_to(base_path))
+            thumbnail = "/" + rel_path.replace("\\", "/")
+            break
+
+    # Get file sizes
+    total_size = sum(f.stat().st_size for f in lora_path.rglob("*") if f.is_file())
+
+    return {
+        "name": lora_name,
+        "path": str(lora_path),
+        "valid": has_config,
+        "thumbnail": thumbnail,
+        "trigger_word": metadata.get("trigger_word", "ohwx"),
+        "description": metadata.get("description", ""),
+        "created_at": metadata.get("created_at"),
+        "training_steps": metadata.get("training_steps"),
+        "size_mb": round(total_size / (1024 * 1024), 2)
+    }
+
+
+@app.put("/loras/{lora_name}")
+async def update_lora(lora_name: str, config: LoRAUpdateConfig):
+    """Update LoRA metadata (name, trigger word, description)"""
+    base_path = Path(__file__).parent.parent
+    lora_path = base_path / "models" / "loras" / lora_name
+
+    if not lora_path.exists():
+        return {"error": "LoRA not found"}
+
+    # Load existing metadata
+    meta_path = lora_path / "lora_metadata.json"
+    metadata = {}
+    if meta_path.exists():
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except Exception:
+            pass
+
+    # Update fields
+    if config.trigger_word is not None:
+        metadata["trigger_word"] = config.trigger_word
+    if config.description is not None:
+        metadata["description"] = config.description
+
+    # Save metadata
+    meta_path.write_text(json.dumps(metadata, indent=2))
+
+    # Rename if name changed
+    if config.name and config.name != lora_name:
+        new_path = base_path / "models" / "loras" / config.name
+        if new_path.exists():
+            return {"error": "A LoRA with that name already exists"}
+        lora_path.rename(new_path)
+        return {"status": "updated", "new_name": config.name}
+
+    return {"status": "updated"}
+
+
+@app.delete("/loras/{lora_name}")
+async def delete_lora(lora_name: str):
+    """Delete a LoRA"""
+    base_path = Path(__file__).parent.parent
+    lora_path = base_path / "models" / "loras" / lora_name
+
+    if not lora_path.exists():
+        return {"error": "LoRA not found"}
+
+    # Delete directory and all contents
+    shutil.rmtree(lora_path)
+
+    return {"status": "deleted", "name": lora_name}
+
+
+@app.post("/loras/{lora_name}/thumbnail")
+async def upload_lora_thumbnail(lora_name: str, file: UploadFile = File(...)):
+    """Upload a thumbnail for a LoRA"""
+    from PIL import Image as PILImage
+    import io
+
+    base_path = Path(__file__).parent.parent
+    lora_path = base_path / "models" / "loras" / lora_name
+
+    if not lora_path.exists():
+        return {"error": "LoRA not found"}
+
+    # Read and resize image
+    content = await file.read()
+    img = PILImage.open(io.BytesIO(content))
+    img = img.convert("RGB")
+
+    # Resize to thumbnail size (256x256)
+    img.thumbnail((256, 256), PILImage.Resampling.LANCZOS)
+
+    # Save as PNG
+    thumb_path = lora_path / "thumbnail.png"
+    img.save(thumb_path, "PNG", quality=90)
+
+    rel_path = str(thumb_path.relative_to(base_path))
+    return {"thumbnail": "/" + rel_path.replace("\\", "/")}
+
+
+# ===== IMG2IMG ENDPOINTS =====
+
+@app.post("/upload-input-image")
+async def upload_input_image(file: UploadFile = File(...)):
+    """Upload an input image for img2img generation"""
+    input_dir = Path(__file__).parent.parent / "inputs"
+    input_dir.mkdir(exist_ok=True)
+
+    # Save with unique name
+    import uuid
+    ext = Path(file.filename).suffix or ".png"
+    filename = f"{uuid.uuid4().hex[:8]}{ext}"
+    file_path = input_dir / filename
+
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    base_path = Path(__file__).parent.parent
+    rel_path = str(file_path.relative_to(base_path))
+    return {
+        "path": str(file_path),
+        "url": "/" + rel_path.replace("\\", "/")
+    }
+
+
+@app.post("/generate-img2img")
+async def generate_img2img(config: Img2ImgGenerationConfig, input_image_path: str):
+    """
+    Generate a single image using img2img with LoRA.
+    This is the "Generate" section - for testing that everything works.
+
+    - LoRA is applied at full strength (lora_strength=1.0)
+    - Creativity controls how much the output deviates from input (0-1)
+    """
+    base_path = Path(__file__).parent.parent
+
+    # Resolve input image path
+    if not Path(input_image_path).is_absolute():
+        input_image_path = str(base_path / input_image_path.lstrip("/"))
+
+    if not Path(input_image_path).exists():
+        return {"error": f"Input image not found: {input_image_path}"}
+
+    try:
+        image_path = await get_img2img_generator().generate(
+            input_image=input_image_path,
+            prompt=config.prompt,
+            negative_prompt=config.negative_prompt,
+            lora_path=config.lora_path,
+            lora_strength=config.lora_strength,
+            creativity=config.creativity,
+            steps=config.steps,
+            guidance_scale=config.guidance_scale,
+            width=config.width,
+            height=config.height,
+            seed=config.seed,
+            output_dir=str(base_path / "outputs" / "generated")
+        )
+
+        # Convert to relative path for frontend
+        rel_path = str(Path(image_path).relative_to(base_path))
+        return {"image_path": "/" + rel_path.replace("\\", "/")}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+
+@app.post("/iterate-img2img")
+async def run_img2img_iteration(config: Img2ImgIterationConfig, input_image_path: str):
+    """
+    Run img2img iteration with 5 creativity levels (default: 0.0, 0.2, 0.4, 0.6, 0.8).
+    This is the "Iterate" section - generates 5 versions at different creativity levels.
+
+    - LoRA is applied at full strength (lora_strength=1.0)
+    - Each version shows a different level of deviation from input
+    """
+    base_path = Path(__file__).parent.parent
+
+    # Resolve input image path
+    if not Path(input_image_path).is_absolute():
+        input_image_path = str(base_path / input_image_path.lstrip("/"))
+
+    if not Path(input_image_path).exists():
+        return {"error": f"Input image not found: {input_image_path}"}
+
+    async def iterate_task():
+        async def progress_cb(creativity, path):
+            rel_path = str(Path(path).relative_to(base_path))
+            await broadcast({
+                "type": "img2img_iteration_progress",
+                "data": {"creativity": creativity, "path": "/" + rel_path.replace("\\", "/")}
+            })
+
+        try:
+            results = await get_img2img_generator().generate_creativity_sweep(
+                input_image=input_image_path,
+                prompt=config.prompt,
+                lora_path=config.lora_path,
+                creativity_values=config.creativity_values,
+                lora_strength=config.lora_strength,
+                seed=config.seed,
+                output_dir=str(base_path / "outputs" / "generated"),
+                progress_callback=progress_cb,
+                negative_prompt=config.negative_prompt,
+                steps=config.steps,
+                guidance_scale=config.guidance_scale,
+                width=config.width,
+                height=config.height,
+            )
+
+            # Convert paths for frontend
+            for r in results:
+                if r.get("path"):
+                    rel_path = str(Path(r["path"]).relative_to(base_path))
+                    r["path"] = "/" + rel_path.replace("\\", "/")
+
+            await broadcast({"type": "img2img_iteration_complete", "data": results})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            await broadcast({
+                "type": "img2img_iteration_error",
+                "data": {"error": str(e)}
+            })
+
+    asyncio.create_task(iterate_task())
+    return {"status": "Img2img iteration started"}
 
 
 @app.get("/generated-images")
@@ -379,6 +717,27 @@ async def list_generated_images():
                     "path": "/" + rel_path.replace("\\", "/")
                 })
     return {"images": images}
+
+
+@app.delete("/delete-image")
+async def delete_image(path: str):
+    """Delete a generated image"""
+    base_path = Path(__file__).parent.parent
+
+    # Security: ensure path is within our outputs directory
+    clean_path = path.lstrip("/").replace("\\", "/")
+    if not clean_path.startswith("outputs/"):
+        raise HTTPException(status_code=400, detail="Can only delete files in outputs directory")
+
+    file_path = base_path / clean_path
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        file_path.unlink()
+        return {"status": "deleted", "path": path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete: {str(e)}")
 
 
 @app.get("/refined-images")
